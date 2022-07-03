@@ -1,3 +1,16 @@
+基于 [lipssmycode](https://github.com/lipssmycode) 的 [byrbt_bot](https://github.com/lipssmycode/byrbt_bot) 项目，将 Transmission 修改为 [qBittorent](https://www.qbittorrent.org/)。
+
+主要修改内容：
+
+- 修改`utils/bit_torrent_utils.py`，将 Transmission 相关代码修改为调用 qBittorrent 的 API。
+- 修改`requirements.txt`。
+- 将`config.ini`重命名为了`config.template.ini`，避免被 git 读取。
+- 因能力有限，移除了`Docker`相关文件。
+
+以下为原作者的说明文档。
+
+----
+
 # byrbt_bot
 
 [![byrbt](https://img.shields.io/static/v1?label=ByrBt&message=2.0&color=blue)](https://github.com/lipssmycode/byrbt_bot) [![Python](https://img.shields.io/badge/python-3.7-plastic?logo=python&logoColor=#3776AB&link=https://www.python.org/)](https://www.python.org/) [![Transmission](https://img.shields.io/static/v1?label=Transmission&message=3.00&color=red)](https://transmissionbt.com/)

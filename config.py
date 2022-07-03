@@ -39,6 +39,10 @@ class ReadConfig:
         value = self.cf.get("Transmission", param, fallback=None)
         return value
 
+    def get_qbittorrent_config(self, param):
+        value = self.cf.get("qBittorrent", param, fallback=None)
+        return value
+
 
 if __name__ == '__main__':
     test = ReadConfig()
