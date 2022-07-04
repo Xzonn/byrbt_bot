@@ -11,6 +11,7 @@ import requests
 from bs4 import BeautifulSoup
 from PIL import Image
 from io import BytesIO
+from hashlib import md5
 import pickle
 import time
 import os
@@ -50,13 +51,18 @@ class LoginTool:
         session = requests.session()
         for i in range(5):
             login_content = session.get(self.login_url)
-            login_soup = BeautifulSoup(login_content.text, 'lxml')
+            login_soup = BeautifulSoup(login_content.text, 'html.parser')
 
             img_url = self.base_url + login_soup.select('#nav_block > form > table > tr:nth-of-type(3) img')[0].attrs[
                 'src']
             img_file = Image.open(BytesIO(session.get(img_url).content))
 
             captcha_text = decaptcha.decode(img_file)
+
+            if img_url.split('=')[-1] != md5(captcha_text.encode("utf-8")).hexdigest():
+                print("hash value mismatch, retry")
+                time.sleep(1)
+                continue
 
             login_res = session.post(self.get_url('takelogin.php'),
                                      headers=self.headers,
@@ -73,6 +79,7 @@ class LoginTool:
                     pickle.dump(cookies, f)
                 return cookies
 
+            print("failed to login, retry")
             time.sleep(1)
 
         print('login fail!')

@@ -372,7 +372,7 @@ class TorrentBot(ContextDecorator):
             try:
                 torrents_soup = BeautifulSoup(
                     requests.get(self.torrent_url, cookies=self.cookie_jar, headers=self.headers).content,
-                    features="lxml")
+                    features="html.parser")
                 flag = True
             except Exception as e:
                 print('[ERROR] ' + repr(e))

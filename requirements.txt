@@ -1,15 +1,8 @@
 # python==3.7.9
 # pip==21.3.1
-#
-# if scikit-learn can not be installed, you can add the following package
-Cython
 
 beautifulsoup4==4.10.0
-numpy==1.21.4
+scikit-learn==1.1.1
 pillow==8.4.0
-scikit-learn==0.21.3
 requests==2.26.0
-lxml==4.6.4
-scipy==1.7.2
-six==1.16.0
 bencoding==0.2.6
