@@ -28,6 +28,10 @@ class Torrent:
         self.rateUpload = data["upspeed"]
         self.status = TorrentStatus(hash, data)
         self.total_size = data["size"]
+        self.name = data["name"]
+    
+    def __str__(self):
+        return f'Torrent "{self.name}"'
 
 class BitTorrent:
     def __init__(self, config):
