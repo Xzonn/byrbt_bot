@@ -8,17 +8,10 @@
 """
 
 import requests
-from bs4 import BeautifulSoup
-from PIL import Image
-from io import BytesIO
-from hashlib import md5
 import pickle
 import time
 import os
-from utils.decaptcha import DeCaptcha
 
-decaptcha = DeCaptcha()
-decaptcha.load_model('utils/captcha_classifier.pkl')
 
 
 class LoginTool:
@@ -36,7 +29,6 @@ class LoginTool:
         return self.base_url + url
 
     def load_cookie(self):
-        byrbt_cookies = None
         if os.path.exists(self.cookie_save_path):
             print('find ByrbtCookies.pickle, loading cookies')
             read_path = open(self.cookie_save_path, 'rb')
@@ -50,26 +42,13 @@ class LoginTool:
     def login(self):
         session = requests.session()
         for i in range(5):
-            login_content = session.get(self.login_url)
-            login_soup = BeautifulSoup(login_content.text, 'html.parser')
-
-            img_url = self.base_url + login_soup.select('#nav_block > form > table > tr:nth-of-type(3) img')[0].attrs[
-                'src']
-            img_file = Image.open(BytesIO(session.get(img_url).content))
-
-            captcha_text = decaptcha.decode(img_file)
-
-            if img_url.split('=')[-1] != md5(captcha_text.encode("utf-8")).hexdigest():
-                print("hash value mismatch, retry")
-                time.sleep(1)
-                continue
-
             login_res = session.post(self.get_url('takelogin.php'),
                                      headers=self.headers,
-                                     data=dict(username=str(self.config.get_bot_config("username")),
-                                               password=str(self.config.get_bot_config("passwd")),
-                                               imagestring=captcha_text,
-                                               imagehash=img_url.split('=')[-1]))
+                                     data=dict(
+                                         logintype="username",
+                                         userinput=str(self.config.get_bot_config("username")),
+                                         password=str(self.config.get_bot_config("passwd")),
+                                         autologin="yes"))
             if '最近消息' in login_res.text:
                 cookies = {}
                 for k, v in session.cookies.items():
