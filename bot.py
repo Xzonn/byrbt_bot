@@ -1,14 +1,10 @@
 # -*- encoding: utf-8 -*-
-"""
-@File    : bot.py
-@Time    : 2021/11/20 17:15
-@Author  : smy
-@Email   : smyyan@foxmail.com
-@Software: PyCharm
-"""
 
-from config import ReadConfig
-from login import LoginTool
+import traceback
+from clients.base import Client, TorrentStatus
+from clients.qbittorrent import qBittorrent
+from config import Config
+from util import Util
 
 import signal
 import sys
@@ -16,490 +12,377 @@ import os
 import pickle
 import re
 import time
-import requests
 from contextlib import ContextDecorator
-from requests.cookies import RequestsCookieJar
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 
-from utils.bit_torrent_utils import BitTorrent
+
+import logging
+
+logging.basicConfig(filename="bot.log", level=logging.INFO)
+
+
+# def print(*args):
+#  logging.info(" ".join(args))
+
+
+class TorrentInfo:
+  def __init__(
+    self,
+    category: str,
+    tag: str,
+    is_seeding: bool,
+    is_finished: bool,
+    seed_id: int,
+    title: str,
+    seeding: int,
+    downloading: int,
+    finished: int,
+    file_size: str,
+  ):
+    self.category = category
+    self.tag = tag
+    self.is_seeding = is_seeding
+    self.is_finished = is_finished
+    self.seed_id = seed_id
+    self.title = title
+    self.seeding = seeding
+    self.downloading = downloading
+    self.finished = finished
+    self.file_size = file_size
 
 
 def _handle_interrupt(signum, frame):
-    sys.exit()  # will trigger a exception, causing __exit__ to be called
+  sys.exit()  # will trigger a exception, causing __exit__ to be called
+
+
+def convert_size(size: str) -> int:
+  size = size.strip()
+  if "TiB" in size:
+    return int(float(size.replace("TiB", "").strip()) * 1024 * 1024 * 1024 * 1024)
+  elif "GiB" in size:
+    return int(float(size.replace("GiB", "").strip()) * 1024 * 1024 * 1024)
+  elif "MiB" in size:
+    return int(float(size.replace("MiB", "").strip()) * 1024 * 1024)
+  elif "KiB" in size:
+    return int(float(size.replace("KiB", "").strip()) * 1024)
+  elif "B" in size:
+    return int(float(size.replace("B", "").strip()))
+  else:
+    return 0
 
 
 class TorrentBot(ContextDecorator):
-    def __init__(self, config, login, torrent_util):
-        super(TorrentBot, self).__init__()
-        self.config = config
-        self.login = login
-        self.torrent_util = torrent_util
-        self.base_url = str(config.get_bot_config("byrbt-url"))
-        self.torrent_url = self._get_url('torrents.php')
-        self.cookie_jar = RequestsCookieJar()
-        self.byrbt_cookies = login.load_cookie()
-        if self.byrbt_cookies is not None:
-            for k, v in self.byrbt_cookies.items():
-                self.cookie_jar[k] = v
+  def __init__(self, config: Config, util: Util, client: Client):
+    super(TorrentBot, self).__init__()
+    self.config = config
+    self.util = util
+    self.client = client
+    self.torrent_url = self.util.get_url("torrents.php")
 
-        self.old_torrent = list()
-        self.torrent_download_record_save_path = './data/torrent.pkl'
-        self.max_torrent_count = int(config.get_bot_config("max-torrent"))
-        # all size in Byte
-        self.max_torrent_total_size = int(config.get_bot_config("max-torrent-total-size"))
-        if self.max_torrent_total_size is None or self.max_torrent_total_size < 0:
-            self.max_torrent_total_size = 0
-        self.max_torrent_total_size = self.max_torrent_total_size * 1024 * 1024 * 1024
-        self.torrent_max_size = int(config.get_bot_config("torrent-max-size"))
-        if self.torrent_max_size is None or self.torrent_max_size > 1024:
-            print("torrent-max-size wrong setting, Use default setting: torrent-max-size: 1024G")
-            self.torrent_max_size = 1024
-        self.torrent_max_size = self.torrent_max_size * 1024 * 1024 * 1024
-        self.torrent_min_size = int(config.get_bot_config("torrent-min-size"))
-        if self.torrent_min_size is None or self.torrent_min_size < 1:
-            print("torrent-min-size wrong setting, Use default setting: torrent-min-size: 1G")
-            self.torrent_min_size = 1
-        self.torrent_min_size = self.torrent_min_size * 1024 * 1024 * 1024
-        if self.torrent_min_size > self.torrent_max_size:
-            print("torrent-min-size is greater than torrent-max-size, please check config.ini! Use default setting: "
-                  "torrent-max-size: 1024G, torrent-min-size: 1G")
-            self.torrent_max_size = 1024 * 1024 * 1024 * 1024
-            self.torrent_min_size = 1 * 1024 * 1024 * 1024
+    self.old_torrent = list()
+    self.record_path = "./data/torrent.pkl"
+    self.max_torrent_count = int(config.get_bot_config("max-torrent"))
 
-        self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/60.0.3112.113 Safari/537.36'}
-        self._filter_tags = ['免费', '免费&2x上传']
-        self._tag_map = {
-            # highlight & tag
-            'free': '免费',
-            'twoup': '2x上传',
-            'twoupfree': '免费&2x上传',
-            'halfdown': '50%下载',
-            'twouphalfdown': '50%下载&2x上传',
-            'thirtypercentdown': '30%下载',
-            # icon
-            '2up': '2x上传',
-            'free2up': '免费&2x上传',
-            '50pctdown': '50%下载',
-            '50pctdown2up': '50%下载&2x上传',
-            '30pctdown': '30%下载',
-        }
-        self._cat_map = {
-            '电影': 'movie',
-            '剧集': 'episode',
-            '动漫': 'anime',
-            '音乐': 'music',
-            '综艺': 'show',
-            '游戏': 'game',
-            '软件': 'software',
-            '资料': 'material',
-            '体育': 'sport',
-            '记录': 'documentary',
-        }
+    # all size in Byte
+    max_torrent_total_size = int(config.get_bot_config("max-torrent-total-size"))
+    self.max_torrent_total_size = max_torrent_total_size * 1024 * 1024 * 1024
 
-    def __enter__(self):
-        print('启动byrbt_bot!')
-        time.sleep(5)  # wait transmission process
-        signal.signal(signal.SIGINT, _handle_interrupt)
-        signal.signal(signal.SIGTERM, _handle_interrupt)
-        os.makedirs(os.path.dirname(self.torrent_download_record_save_path), mode=0o755, exist_ok=True)
-        if os.path.exists(self.torrent_download_record_save_path):
-            self.old_torrent = pickle.load(open(self.torrent_download_record_save_path, 'rb'))
-        return self
+    torrent_max_size = int(config.get_bot_config("torrent-max-size"))
+    if torrent_max_size == 0:
+      torrent_max_size = 1024
+    self.torrent_max_size = torrent_max_size * 1024 * 1024 * 1024
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        print('退出')
-        print('保存数据')
-        pickle.dump(self.old_torrent, open(self.torrent_download_record_save_path, 'wb'), protocol=2)
+    torrent_min_size = int(config.get_bot_config("torrent-min-size"))
+    if torrent_min_size == 0:
+      self.torrent_min_size = 1
+    self.torrent_min_size = torrent_min_size * 1024 * 1024 * 1024
 
-    def _get_url(self, url):
-        return self.base_url + url
+    if self.torrent_min_size > self.torrent_max_size:
+      self.torrent_max_size, self.torrent_min_size = self.torrent_min_size, self.torrent_max_size
 
-    def _get_tag(self, tag):
-        try:
-            if tag == '':
-                return ''
-            else:
-                tag = tag.split('_')[0]
+    self._filter_tags = ["免费", "免费&2x上传"]
+    self._tag_map = {
+      # highlight & tag
+      "free": "免费",
+      "twoup": "2x上传",
+      "twoupfree": "免费&2x上传",
+      "halfdown": "50%下载",
+      "twouphalfdown": "50%下载&2x上传",
+      "thirtypercentdown": "30%下载",
+      # icon
+      "2up": "2x上传",
+      "free2up": "免费&2x上传",
+      "50pctdown": "50%下载",
+      "50pctdown2up": "50%下载&2x上传",
+      "30pctdown": "30%下载",
+    }
+    self._cat_map = {
+      "电影": "movie",
+      "剧集": "episode",
+      "动漫": "anime",
+      "音乐": "music",
+      "综艺": "show",
+      "游戏": "game",
+      "软件": "software",
+      "资料": "material",
+      "体育": "sport",
+      "记录": "documentary",
+    }
 
-            return self._tag_map[tag]
-        except KeyError:
-            return ''
+  def __enter__(self):
+    print("启动byrbt_bot!")
+    time.sleep(5)  # wait transmission process
+    signal.signal(signal.SIGINT, _handle_interrupt)
+    signal.signal(signal.SIGTERM, _handle_interrupt)
+    if os.path.exists(self.record_path):
+      with open(self.record_path, "rb") as reader:
+        self.old_torrent = pickle.load(reader)
+    return self
 
-    def get_user_info(self, user_info_block):
-        print("user info:")
-        try:
-            user_name = user_info_block.select_one('.nowrap').text
-            user_info_text = user_info_block.text
-            index_s = user_info_text.find('等级')
-            index_e = user_info_text.find('当前活动')
-            if index_s == -1 or index_e == -1:
-                print("[]")
-                return
-            user_info_text = user_info_text[index_s:index_e]
-            user_info_text = re.sub("[\xa0\n]", ' ', user_info_text)
-            user_info_text = re.sub("\[[^\[]*\]", '', user_info_text).replace('：', ':')
-            user_info_text = re.sub(" *: *", ':', user_info_text).strip()
-            user_info_text = re.sub("\s+", ' ', user_info_text)
-            user_info_text = "用户名:" + user_name + " " + user_info_text
-            print(user_info_text)
+  def __exit__(self, exc_type, exc_val, exc_tb):
+    print("退出")
+    print("保存数据")
+    os.makedirs(os.path.dirname(self.record_path), 0o755, True)
+    with open(self.record_path, "wb") as writer:
+      pickle.dump(self.old_torrent, writer, protocol=2)
 
-        except Exception as e:
-            print("user info not found!")
-            print('[ERROR] ' + repr(e))
+  def _get_tag(self, tag):
+    if tag == "":
+      return ""
+    else:
+      tag = tag.split("_")[0]
 
-    def get_torrent_info_filter_by_tag(self, table, filter_tags):
-        assert isinstance(table, list)
-        start_idx = 1  # static offset
-        torrent_infos = list()
-        for item in table:
-            torrent_info = dict()
-            tds = item.find_all('td', recursive=False)
-            # tds[0] 是 引用
+    return self._tag_map.get(tag, "")
 
-            # tds[1] 是分类
-            cat = tds[start_idx].find('a').text.strip()
+  def print_user_info(self, user_info_block: Tag):
+    user_name = user_info_block.select_one(".nowrap").text
+    user_info_text = user_info_block.text
+    index_s = user_info_text.find("等级")
+    index_e = user_info_text.find("当前活动")
+    if index_s == -1 or index_e == -1:
+      raise ValueError("未找到用户信息")
+    user_info_text = user_info_text[index_s:index_e]
+    user_info_text = re.sub(r"[\xa0\n]", " ", user_info_text)
+    user_info_text = re.sub(r"\[[^\[]*\]", "", user_info_text).replace(":", "：")
+    user_info_text = re.sub(r" *: *", "：", user_info_text).strip()
+    user_info_text = re.sub(r"\s+", " ", user_info_text)
+    logging.info(f"用户名：{user_name} {user_info_text}")
 
-            # 主要信息的td
-            main_td = tds[start_idx + 1].select('table > tr > td')[0]
-            if main_td.find('div'):
-                main_td = tds[start_idx + 1].select('table > tr > td')[1]
+  def get_filtered_torrents(self, rows: list[Tag]) -> list[TorrentInfo]:
+    torrent_infos: list[TorrentInfo] = []
+    for row in rows:
+      cells = row.select("td.rowfollow")[1:]
+      if len(cells) < 8:
+        continue
 
-            # 链接
-            href = main_td.select('a')[0].attrs['href']
+      category = cells[0].find("a").text.strip()
 
-            # 种子id
-            seed_id = re.findall(r'id=(\d+)', href)[0]
+      # 主要信息的td
+      main_info = cells[1]
+      main_td = cells[1].select("table > tr > td")[0]
+      if main_td.find("div"):
+        # 置顶
+        main_td = cells[1].select("table > tr > td")[1]
 
-            # 标题
-            title = main_td.find('a').attrs['title']
+      # 标记
+      tag = ""
+      row_class = row.attrs["class"][0]
+      if row_class.endswith("_bg"):
+        tag = self._tag_map.get(row_class.removesuffix("_bg"), "")
 
-            tags = set(
-                [font.attrs['class'][0] for font in main_td.select('span > span') if 'class' in font.attrs.keys()])
-            if '' in tags:
-                tags.remove('')
+      icons = main_info.select("img")
+      is_seeding = False
+      is_finished = False
+      for icon in icons:
+        icon_src = icon.attrs["src"]
+        if icon_src == "/pic/seeding.png":
+          is_seeding = True
+          continue
+        elif icon_src == "/pic/finished.png":
+          is_finished = True
+          continue
 
-            is_seeding = len(main_td.select('img[src="/pic/seeding.png"]')) > 0
-            is_finished = len(main_td.select('img[src="/pic/finished.png"]')) > 0
+        icon_class = icon.attrs.get("class", [""])[0]
+        if not tag and icon_class.startswith("pro_"):
+          tag = self._tag_map.get(icon_class.removeprefix("pro_"), tag)
 
-            is_hot = False
-            if 'hot' in tags:
-                is_hot = True
-                tags.remove('hot')
-            is_new = False
-            if 'new' in tags:
-                is_new = True
-                tags.remove('new')
-            is_recommended = False
-            if 'recommended' in tags:
-                is_recommended = True
-                tags.remove('recommended')
+      if not tag:
+        tags = [_.attrs["class"][0] for _ in main_info.select("span > span") if "class" in _.attrs]
+        for _ in tags:
+          tag = self._tag_map.get(_, tag)
 
-            # 根据控制面板中促销种子的标记方式不同来匹配
-            if 'class' in item.attrs:
-                # 默认高亮方式
-                tag = self._get_tag(item.attrs['class'][0])
-            elif len(tags) == 1:
-                # 文字标记方式
-                # 不属于 hot、new、recommended 的标记即为促销标记
-                tag = self._get_tag(list(tags)[0])
-            elif len(main_td.select('img[src="/pic/trans.gif"][class^="pro_"]')) > 0:
-                # 添加图标方式
-                tag = self._get_tag(
-                    main_td.select('img[src="/pic/trans.gif"][class^="pro_"]')[-1].attrs['class'][0].split('_')[-1])
-            else:
-                tag = ''
+      if tag not in self._filter_tags:
+        continue
 
-            file_size = tds[start_idx + 4].text.split('\n')
+      torrent_link = main_info.select_one("a")
+      # 种子id
+      seed_id: int = re.findall(r"id=(\d+)", torrent_link.attrs["href"])[0]
 
-            seeding = int(tds[start_idx + 5].text) if tds[start_idx + 5].text.isdigit() else -1
+      # 标题
+      title: str = torrent_link.attrs["title"]
 
-            downloading = int(tds[start_idx + 6].text) if tds[start_idx + 6].text.isdigit() else -1
+      file_size = cells[4].text.replace("\n", " ")
+      seeding = int(cells[5].text) if cells[5].text.isdigit() else -1
+      downloading = int(cells[6].text) if cells[6].text.isdigit() else -1
+      finished = int(cells[7].text) if cells[7].text.isdigit() else -1
 
-            finished = int(tds[start_idx + 7].text) if tds[start_idx + 7].text.isdigit() else -1
+      torrent_info = TorrentInfo(
+        category, tag, is_seeding, is_finished, seed_id, title, seeding, downloading, finished, file_size
+      )
+      torrent_infos.append(torrent_info)
 
-            torrent_info['cat'] = cat
-            torrent_info['is_hot'] = is_hot
-            torrent_info['tag'] = tag
-            torrent_info['is_seeding'] = is_seeding
-            torrent_info['is_finished'] = is_finished
-            torrent_info['seed_id'] = seed_id
-            torrent_info['title'] = title
-            torrent_info['seeding'] = seeding
-            torrent_info['downloading'] = downloading
-            torrent_info['finished'] = finished
-            torrent_info['file_size'] = file_size
-            torrent_info['is_new'] = is_new
-            torrent_info['is_recommended'] = is_recommended
-            torrent_infos.append(torrent_info)
+    return torrent_infos
 
-        torrent_infos_filter_by_tag = list()
-        for torrent_info in torrent_infos:
-            if torrent_info['tag'] in filter_tags:
-                torrent_infos_filter_by_tag.append(torrent_info)
+  # 获取可用的种子的策略，可自行修改
+  def get_favorable_torrents(self, torrents: list[TorrentInfo]) -> list[TorrentInfo]:
+    farvorable_torrents = []
+    is_strict = len(torrents) >= 20
+    if is_strict:
+      # 遇到free或者免费种子太过了，择优选取，标准是(下载数/上传数)>20，并且文件大小大于20GB
+      logging.info("符合要求的种子过多，可能开启Free活动了，提高种子获取标准")
 
-        return torrent_infos_filter_by_tag
+    for torrent_info in torrents:
+      if torrent_info.seed_id in self.old_torrent or torrent_info.is_seeding or torrent_info.is_finished:
+        continue
 
-    # 获取可用的种子的策略，可自行修改
-    def get_ok_torrent(self, torrent_infos):
-        ok_infos = list()
-        if len(torrent_infos) >= 20:
-            # 遇到free或者免费种子太过了，择优选取，标准是(下载数/上传数)>20，并且文件大小大于20GB
-            print('符合要求的种子过多，可能开启Free活动了，提高种子获取标准')
-            for torrent_info in torrent_infos:
-                if torrent_info['seed_id'] in self.old_torrent:
-                    continue
-                # 下载1GB-1TB之间的种子（下载以GB大小结尾的种子，脚本需要不可修改）
-                if 'GiB' not in torrent_info['file_size'][0]:
-                    continue
-                if torrent_info['seeding'] <= 0 or torrent_info['downloading'] < 0:
-                    continue
-                if torrent_info['seeding'] != 0 and float(torrent_info['downloading']) / float(
-                        torrent_info['seeding']) < 20:
-                    continue
-                file_size = torrent_info['file_size'][0]
-                file_size = file_size.replace('GiB', '')
-                file_size = float(file_size.strip())
-                if file_size < 20.0:
-                    continue
-                ok_infos.append(torrent_info)
-        else:
-            # 正常种子选择标准是免费种子并且(下载数/上传数)>0.6
-            for torrent_info in torrent_infos:
-                if torrent_info['seed_id'] in self.old_torrent:
-                    continue
-                # 下载1GB-1TB之间的种子（下载以GB大小结尾的种子，脚本需要不可修改）
-                if 'GiB' not in torrent_info['file_size'][0]:
-                    continue
-                if torrent_info['seeding'] <= 0 or torrent_info['downloading'] < 0:
-                    continue
-                if torrent_info['seeding'] != 0 and float(torrent_info['downloading']) / float(
-                        torrent_info['seeding']) < 0.6:
-                    continue
-                ok_infos.append(torrent_info)
-        return ok_infos
+      if torrent_info.seeding <= 0 or torrent_info.downloading < 0:
+        continue
+      if torrent_info.downloading / torrent_info.seeding < (20 if is_strict else 0.6):
+        continue
+      file_size = convert_size(torrent_info.file_size)
+      if is_strict and file_size < 20 * 1024 * 1024 * 1024 or file_size > self.torrent_max_size:
+        continue
+      elif file_size < self.torrent_min_size or file_size > self.torrent_max_size:
+        continue
 
-    def check_remove(self, add_num=0):
-        torrent_list = self.torrent_util.get_list()
-        if torrent_list is None:
-            print('get torrent list fail!')
-            return
+      farvorable_torrents.append(torrent_info)
 
-        torrent_len = len(torrent_list) + add_num
-        if torrent_len <= self.max_torrent_count:
-            return
-        torrent_list.sort(key=lambda x: (x.date_added, x.rateUpload))
-        while torrent_len > self.max_torrent_count and len(torrent_list) > 0:
-            remove_torrent_info = torrent_list.pop(0)
-            if remove_torrent_info.status.checking:
-                continue
-            # rateUpload > 500KB/s
-            if (remove_torrent_info.status.downloading or remove_torrent_info.status.seeding) and \
-                    remove_torrent_info.rateUpload > 500000:
-                continue
-            res = self.torrent_util.remove(remove_torrent_info.id, delete_data=True)
-            if res:
-                print('remove torrent success: ' + str(remove_torrent_info))
-            else:
-                print('remove torrent fail: ' + str(remove_torrent_info))
-            torrent_len = torrent_len - 1
+    return farvorable_torrents
 
-    def download(self, torrent_id):
-        download_url = 'download.php?id={}'.format(torrent_id)
-        download_url = self._get_url(download_url)
-        flag = False
-        r = None
-        for i in range(5):
-            try:
-                r = requests.get(download_url, cookies=self.cookie_jar, headers=self.headers)
-                flag = True
-                break
-            except Exception as e:
-                print('[ERROR] ' + repr(e))
-                print('try login...')
-                self.byrbt_cookies = self.login.load_cookie()
-                if self.byrbt_cookies is not None:
-                    self.cookie_jar = RequestsCookieJar()
-                    for k, v in self.byrbt_cookies.items():
-                        self.cookie_jar[k] = v
-                time.sleep(1)
+  def check_max_torrents(self, add_num: int = 0):
+    torrent_list = self.client.get_torrents()
+    if not torrent_list:
+      logging.error("获取种子列表失败")
+      return
 
-        if flag is False or r is None:
-            print('login failed!')
+    torrent_length = len(torrent_list) + add_num
+    torrent_list.sort(key=lambda x: (x.upload_speed, x.date_added))
 
-        new_torrent = self.torrent_util.download_from_content(r.content, paused=True)
-        if new_torrent is not None:
-            new_torrent_size = new_torrent.total_size
-            if new_torrent_size < self.torrent_min_size or new_torrent_size > self.torrent_max_size:
-                print('add new torrent fail, name : {}, improper seed size: {} GB, download url: {}'.format(
-                    new_torrent.name, new_torrent_size / 1000000000, download_url))
-                self.old_torrent.append(torrent_id)
-                self.torrent_util.remove(new_torrent.id, delete_data=True)
-                return False
-            res = self.check_free_space_to_download(new_torrent_size)
-            if res is None:
-                self.torrent_util.remove(new_torrent.id, delete_data=True)
-                return False
-            if res is False:
-                self.torrent_util.remove(new_torrent.id, delete_data=True)
-                print('add new torrent fail, not device space to download, name : {}, size: {} GB, '
-                      'download url: {}'.format(new_torrent.name, new_torrent_size / 1000000000, download_url))
-                return False
-            else:
-                if self.torrent_util.start_torrent(new_torrent.id):
-                    print('add torrent: ' + str(res))
-                    self.old_torrent.append(torrent_id)
-                else:
-                    print('add new torrent fail, start torrent fail, name : {}, seed size: {} GB, '
-                          'download url: {}'.format(new_torrent.name, new_torrent_size / 1000000000, download_url))
-                return True
-        else:
-            print('add new torrent fail, download url: ' + download_url)
-            return False
+    for torrent in torrent_list:
+      if torrent_length <= self.max_torrent_count:
+        break
 
-    def start(self):
-        scan_interval_in_sec = 60
-        check_disk_space_interval_in_sec = 500
-        last_check_disk_space_time = -1
-        while True:
-            now_time = int(time.time())
-            if now_time - last_check_disk_space_time > check_disk_space_interval_in_sec:
-                print('check disk space...')
-                if self.check_disk_space():
-                    last_check_disk_space_time = now_time
-                else:
-                    print('check disk space fail!')
-                    time.sleep(scan_interval_in_sec)
-                    continue
+      # 正在检查或上传速度 > 500 KiB/s
+      if torrent.status == TorrentStatus.CHECKING or torrent.upload_speed > 500 * 1024 * 1024:
+        continue
 
-            print('scan torrent list...')
-            flag = False
-            torrents_soup = None
-            torrent_infos = None
-            try:
-                torrents_soup = BeautifulSoup(
-                    requests.get(self.torrent_url, cookies=self.cookie_jar, headers=self.headers).content,
-                    features="html.parser")
-                flag = True
-            except Exception as e:
-                print('[ERROR] ' + repr(e))
-                self.byrbt_cookies = self.login.load_cookie()
-                if self.byrbt_cookies is not None:
-                    self.cookie_jar = RequestsCookieJar()
-                    for k, v in self.byrbt_cookies.items():
-                        self.cookie_jar[k] = v
+      if self.client.remove_torrent(torrent.id, True):
+        logging.info(f"已删除种子：{torrent.name}")
+        torrent_length -= 1
+      else:
+        logging.info(f"删除种子失败：{torrent.name}")
 
-            if flag is False:
-                print('login failed!')
-                break
+  def download(self, torrent_id: int):
+    download_url = self.util.get_url(f"download.php?id={torrent_id}")
+    response = self.util.session.get(download_url)
+    if response.status_code != 200:
+      logging.error(f"下载种子失败：{torrent_id}")
+      return False
 
-            try:
-                user_info_block = torrents_soup.select_one('#info_block').select_one('.navbar-user-data')
-                self.get_user_info(user_info_block)
-            except Exception as e:
-                print('[ERROR] ' + repr(e))
+    self.client.download_from_content(response.content)
 
-            try:
-                torrent_table = torrents_soup.find_all('tr', class_='free_bg')
-                torrent_infos = self.get_torrent_info_filter_by_tag(torrent_table, self._filter_tags)
-                flag = True
-            except Exception as e:
-                print('[ERROR] ' + repr(e))
-                flag = False
+  def check_disk_space(self) -> bool:
+    min_free_space = int(self.config.get_bot_config("min-free-space-size")) * 1024 * 1024 * 1024
+    free_space = self.client.get_free_space()
+    if free_space == 0:
+      return False
 
-            if flag is False:
-                print('failed to parse torrent table!')
-                break
-            print('free torrent list：')
-            for i, info in enumerate(torrent_infos):
-                print('{} : {} {} {}'.format(i, info['seed_id'], info['file_size'], info['title']))
+    if free_space >= min_free_space:
+      return True
 
-            ok_torrent = self.get_ok_torrent(torrent_infos)
-            print('available torrent list：')
-            for i, info in enumerate(ok_torrent):
-                print('{} : {} {} {}'.format(i, info['seed_id'], info['file_size'], info['title']))
-            self.check_remove(add_num=len(ok_torrent))
-            for torrent in ok_torrent:
-                if self.download(torrent['seed_id']) is False:
-                    print('{} download fail'.format(torrent['title']))
-                    continue
+    logging.info("磁盘空间不足，尝试删除种子")
+    torrent_list = self.client.get_torrents()
+    if not torrent_list:
+      logging.warning("获取种子列表失败")
+      return False
+
+    torrent_list.sort(key=lambda x: (x.upload_speed, x.date_added))
+    for torrent in torrent_list:
+      if free_space > min_free_space:
+        break
+
+      # 正在检查或上传速度 > 500 KiB/s
+      if torrent.status == TorrentStatus.CHECKING or torrent.upload_speed > 500 * 1024 * 1024:
+        continue
+
+      if self.client.remove_torrent(torrent.id, True):
+        logging.info(f"已删除种子：{torrent.name}")
+        free_space += torrent.total_size
+      else:
+        logging.info(f"删除种子失败：{torrent.name}")
+
+    return self.client.get_free_space(True) > min_free_space
+
+  def start(self):
+    scan_interval_in_sec = 60
+    check_disk_space_interval_in_sec = 500
+    last_check_disk_space_time = -1
+    while True:
+      try:
+        now = int(time.time())
+        if now - last_check_disk_space_time > check_disk_space_interval_in_sec:
+          logging.info("检查磁盘容量")
+          if self.check_disk_space():
+            last_check_disk_space_time = now
+          else:
+            logging.error("检查磁盘容量失败！")
             time.sleep(scan_interval_in_sec)
-            print()
+            continue
 
-    def check_free_space_to_download(self, new_torrent_size):
-        torrent_list = self.torrent_util.get_list()
-        if torrent_list is None:
-            print('get torrent list fail!')
-            return None
-        free_space = self.torrent_util.get_free_space()
-        if free_space is None:
-            print('get download path free space fail!')
-            return None
-        sum_size = 0
-        for torrent in torrent_list:
-            sum_size += torrent.total_size
+        logging.info("载入种子列表……")
+        response = self.util.session.get(self.torrent_url)
+        if "未登录" in response.text:
+          logging.error("未登录")
+          self.util.login()
+          continue
 
-        if new_torrent_size < free_space and sum_size + new_torrent_size <= self.max_torrent_total_size:
-            return True
+        torrents_soup = BeautifulSoup(response.text, "html.parser")
 
-        print('insufficient disk space, try to remove some torrent...')
-        torrent_list.sort(key=lambda x: (x.date_added, x.rateUpload))
-        while (free_space <= new_torrent_size or sum_size + new_torrent_size > self.max_torrent_total_size) \
-                and len(torrent_list) > 0:
-            remove_torrent_info = torrent_list.pop(0)
-            if remove_torrent_info.status.checking:
-                continue
-            # rateUpload > 500KB/s
-            if (remove_torrent_info.status.downloading or remove_torrent_info.status.seeding) and \
-                    remove_torrent_info.rateUpload > 500000:
-                continue
-            res = self.torrent_util.remove(remove_torrent_info.id, delete_data=True)
-            if res:
-                print('remove torrent success: ' + str(remove_torrent_info))
-            else:
-                print('remove torrent fail: ' + str(remove_torrent_info))
-                return None
-            free_space += remove_torrent_info.total_size
-            sum_size -= remove_torrent_info.total_size
+        try:
+          user_info_block = torrents_soup.select_one("#info_block").select_one(".navbar-user-data")
+          self.print_user_info(user_info_block)
+        except Exception:
+          logging.error(traceback.format_exc())
+          return False
 
-        return self.torrent_util.get_free_space() > new_torrent_size and sum_size + new_torrent_size <= self.max_torrent_total_size
+        torrent_rows = torrents_soup.select(".torrents > tr")
+        filtered_torrents = self.get_filtered_torrents(torrent_rows)
 
-    def check_disk_space(self):
-        free_space = self.torrent_util.get_free_space()
-        if free_space is None:
-            print('get download path free space fail!')
-            return False
+        logging.info("正在促销的种子：")
+        for i, info in enumerate(filtered_torrents):
+          logging.info(f"#{i:>2d} ({info.seed_id}) {info.title}, {info.file_size}")
 
-        if free_space <= 5000000000:  # 5GB
-            print('low disk space, clear torrent...')
-            torrent_list = self.torrent_util.get_list()
-            if torrent_list is None:
-                print('get torrent list fail!')
-                return False
-            torrent_list.sort(key=lambda x: (x.date_added, x.rateUpload))
-            while free_space <= 5000000000 and len(torrent_list) > 0:
-                remove_torrent_info = torrent_list.pop(0)
-                if remove_torrent_info.status.checking:
-                    continue
-                # rateUpload > 500KB/s
-                if (remove_torrent_info.status.downloading or remove_torrent_info.status.seeding) and \
-                        remove_torrent_info.rateUpload > 500000:
-                    continue
-                res = self.torrent_util.remove(remove_torrent_info.id, delete_data=True)
-                if res:
-                    print('remove torrent success: ' + str(remove_torrent_info))
-                else:
-                    print('remove torrent fail: ' + str(remove_torrent_info))
-                    return False
-                free_space += remove_torrent_info.total_size
-            return self.torrent_util.get_free_space() > 5000000000
+        favorable_torrents = self.get_favorable_torrents(filtered_torrents)
+        logging.info("筛选后的种子：")
+        for i, info in enumerate(favorable_torrents):
+          logging.info(f"#{i:>2d} ({info.seed_id}) {info.title}, {info.file_size}")
 
-        return True
+        self.check_max_torrents(len(favorable_torrents))
+        for torrent in favorable_torrents:
+          if self.download(torrent.seed_id) is False:
+            logging.warning(f"下载种子失败：{torrent.title}")
+            continue
+      except Exception:
+        logging.error(traceback.format_exc())
+      finally:
+        time.sleep(scan_interval_in_sec)
+        logging.info("")
 
 
-if __name__ == '__main__':
-    config = ReadConfig(filepath='config/config.ini')
-    login = LoginTool(config)
-    bit_torrent = BitTorrent(config)
-    with TorrentBot(config, login, bit_torrent) as byrbt_bot:
-        byrbt_bot.start()
+if __name__ == "__main__":
+  os.chdir(os.path.dirname(__file__))
+  config = Config("config/config.ini")
+  util = Util(config)
+  client = qBittorrent(config)
+  with TorrentBot(config, util, client) as byrbt_bot:
+    byrbt_bot.start()
